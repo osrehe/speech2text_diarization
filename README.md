@@ -1,4 +1,4 @@
-# Speech2Text ✨ (Whisper + Diarización)
+# Speech2Text (Whisper + Diarización)
 
 Transcribe audios con **OpenAI Whisper** y detecta interlocutores con **pyannote.audio**.\
 Funciona en Windows, Linux y macOS.
@@ -79,6 +79,3 @@ Código MIT.\
 Modelos de terceros mantienen sus propias licencias.
 
 ---
-
-¡Felices transcripciones! 🚀
-
