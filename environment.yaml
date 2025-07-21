@@ -1,0 +1,35 @@
+name: whisper_env
+channels:
+  - conda-forge
+  - pytorch
+  - defaults
+dependencies:
+  # ── base python ─────────────────────────────
+  - python=3.11
+  - numpy<2          # PyTorch 2.2 aún no es compatible con NumPy 2
+  - tqdm
+  - soundfile        # backend de torchaudio
+  - ffmpeg           # binario ffmpeg
+  - sentencepiece
+
+  # ── PyTorch CPU (cambia a bloque CUDA más abajo si tienes GPU) ──
+  - pytorch=2.2  # versión probada
+  - torchvision
+  - torchaudio
+  - cpuonly
+
+  # Si tienes GPU NVIDIA >= Ampere, comenta las 4 líneas anteriores
+  # y descomenta las dos siguientes:
+  # - pytorch=2.2
+  # - torchvision
+  # - torchaudio
+  # - pytorch-cuda=12.1  # canal nvidia
+
+  # ── pip packages ────────────────────────────
+  - pip
+  - pip:
+      - git+https://github.com/openai/whisper.git
+      - pyannote.audio==3.3.2
+      - ffmpeg-python
+      - huggingface_hub
+      - torchmetrics  # requerido indirectamente por pyannote 3.x
