@@ -150,6 +150,7 @@ def prepare_audio_for_pyannote(audio_path: str, logger: Optional[StageLogger] = 
 
     if logger:
         logger.info("Convirtiendo audio para diarizacion: WAV 16kHz mono", always=True)
+        logger.progress(0, "Iniciando conversion de audio", stage_name=f"{logger.current_stage} - Preparacion de audio")
 
     command = [
         "ffmpeg",
@@ -157,6 +158,8 @@ def prepare_audio_for_pyannote(audio_path: str, logger: Optional[StageLogger] = 
         "-nostdin",
         "-loglevel",
         "error",
+        "-progress",
+        "pipe:1",
         "-i",
         audio_path,
         "-ar",
@@ -167,7 +170,31 @@ def prepare_audio_for_pyannote(audio_path: str, logger: Optional[StageLogger] = 
     ]
 
     try:
-        subprocess.run(command, check=True)
+        duration = get_audio_duration(audio_path)
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+
+        if process.stdout:
+            for line in process.stdout:
+                key, separator, value = line.strip().partition("=")
+                if separator and key == "out_time_ms" and duration and logger:
+                    current_seconds = int(value) / 1_000_000
+                    percent = max(0, min(100, int(current_seconds / duration * 100)))
+                    logger.progress(
+                        percent,
+                        f"Convirtiendo audio {format_seconds(current_seconds)}/{format_seconds(duration)}",
+                        stage_name=f"{logger.current_stage} - Preparacion de audio",
+                    )
+
+        stderr = process.stderr.read() if process.stderr else ""
+        return_code = process.wait()
+        if return_code != 0:
+            raise subprocess.CalledProcessError(return_code, command, stderr=stderr)
     except FileNotFoundError as error:
         Path(temp_file.name).unlink(missing_ok=True)
         raise RuntimeError("ffmpeg no esta instalado o no esta disponible en PATH") from error
@@ -177,6 +204,7 @@ def prepare_audio_for_pyannote(audio_path: str, logger: Optional[StageLogger] = 
 
     if logger:
         logger.info(f"Audio temporal para diarizacion: {temp_file.name}", always=True)
+        logger.progress(100, "Audio convertido para diarizacion", stage_name=f"{logger.current_stage} - Preparacion de audio")
 
     return temp_file.name, temp_file.name
 

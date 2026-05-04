@@ -461,8 +461,24 @@ class TranscriberGUI:
 
     def _run_transcription(self, **kwargs: Any) -> None:
         try:
+            self.events.put({
+                "type": "progress",
+                "stage_name": "Preparando motor de procesamiento",
+                "stage_index": 0,
+                "total_stages": 0,
+                "percent": 0,
+                "message": "Cargando dependencias de Whisper y diarizacion...",
+            })
             from transcriber_dia import transcribe_audio_with_diarization
 
+            self.events.put({
+                "type": "progress",
+                "stage_name": "Preparando motor de procesamiento",
+                "stage_index": 0,
+                "total_stages": 0,
+                "percent": 100,
+                "message": "Motor de procesamiento cargado.",
+            })
             result = transcribe_audio_with_diarization(**kwargs)
             self.events.put({"type": "result", "result": result})
         except Exception as exc:
