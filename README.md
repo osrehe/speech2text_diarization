@@ -184,6 +184,16 @@ Al indicar un archivo de salida, generar:
 - `_detailed.txt`: transcripcion con timestamps y hablantes si aplica.
 - `.json`: resultado completo.
 
+## Pruebas
+
+Ejecutar la suite de pruebas unitarias:
+
+```powershell
+python -m unittest discover -s tests
+```
+
+Las pruebas cubren funciones auxiliares del motor, eventos de progreso, asignacion de hablantes, escritura de salidas y logica base de la interfaz grafica sin cargar modelos Whisper ni ejecutar pyannote.
+
 ## Notas
 
 - Considerar que la primera ejecucion de un modelo puede tardar porque descarga pesos.
