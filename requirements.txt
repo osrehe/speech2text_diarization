@@ -1,0 +1,7 @@
+openai-whisper
+pyannote.audio~=3.1          # diarización
+torch>=2.0                   # backend para pyannote y whisper
+tqdm>=4.66
+numpy>=1.23
+soundfile>=0.12              # requerido por pyannote
+ffmpeg-python>=0.2           # utilitario (opcional; ffmpeg binario debe estar instalado)
