@@ -1,6 +1,16 @@
 # Speech2Text
 
-Aplicacion local para transcribir audio con Whisper y, opcionalmente, realizar diarizacion de hablantes con pyannote.
+Speech2Text es una solucion local para convertir archivos de audio o video en texto mediante Whisper. Permite procesar reuniones, entrevistas, llamadas, clases, grabaciones de trabajo u otros registros de voz sin depender de una interfaz web externa para la transcripcion.
+
+La solucion sirve para:
+
+- Transcribir audio a texto en español u otros idiomas soportados por Whisper.
+- Generar archivos de salida en formato `.txt`, `_detailed.txt` y `.json`.
+- Identificar hablantes mediante diarizacion cuando se configura un token de Hugging Face.
+- Revisar el avance del proceso por etapas desde una interfaz grafica.
+- Ejecutar el mismo motor desde consola para automatizar o integrar procesos.
+
+La aplicacion mantiene los modelos Whisper en la carpeta local `models/` y guarda los resultados en `output/`. Para diarizacion, convertir automaticamente formatos no nativos a WAV 16 kHz mono antes de invocar pyannote.
 
 La solucion se centra en dos programas principales:
 
