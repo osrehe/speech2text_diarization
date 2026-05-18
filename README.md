@@ -23,7 +23,7 @@ La solucion se centra en dos programas principales:
 - `ffmpeg` instalado y disponible en el `PATH`.
 - Dependencias Python instaladas dentro de un ambiente virtual.
 
-## Ambiente Virtual
+## mbiente Virtual
 
 Crear el ambiente virtual:
 
