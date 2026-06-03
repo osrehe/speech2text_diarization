@@ -27,7 +27,7 @@ La solucion se centra en dos programas principales:
 
 Crear el ambiente virtual:
 
-```powershell
+```powershell 
 python -m venv whisper_env
 ```
 
