@@ -1,7 +1,8 @@
-openai-whisper
+faster-whisper>=1.0          # motor de transcripción (CTranslate2, ~4x más rápido en CPU)
 pyannote.audio~=3.1          # diarización
-torch>=2.0                   # backend para pyannote y whisper
+torch>=2.0                   # backend para pyannote (faster-whisper usa CTranslate2, no torch)
 tqdm>=4.66
 numpy>=1.23
 soundfile>=0.12              # requerido por pyannote
 ffmpeg-python>=0.2           # utilitario (opcional; ffmpeg binario debe estar instalado)
+tkinterdnd2>=0.3             # arrastrar y soltar en la GUI (opcional)

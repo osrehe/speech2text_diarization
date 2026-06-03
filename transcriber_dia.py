@@ -1,13 +1,10 @@
 import argparse
-import hashlib
-import importlib
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import time
-import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -17,16 +14,9 @@ except ImportError:
     torch = None
 
 try:
-    import whisper
+    from faster_whisper import WhisperModel
 except ImportError:
-    whisper = None
-
-try:
-    from pyannote.audio import Pipeline
-    from pyannote.audio.pipelines.utils.hook import ProgressHook
-except ImportError:
-    Pipeline = None
-    ProgressHook = None
+    WhisperModel = None
 
 try:
     from tqdm import tqdm
@@ -34,11 +24,34 @@ except ImportError:
     tqdm = None
 
 
+def _load_pyannote() -> tuple:
+    """Importa pyannote.audio de forma diferida.
+
+    pyannote es la dependencia mas pesada de importar; solo se carga cuando
+    realmente se va a diarizar, de modo que las transcripciones sin diarizacion
+    arranquen mucho mas rapido.
+    """
+    try:
+        from pyannote.audio import Pipeline
+        from pyannote.audio.pipelines.utils.hook import ProgressHook
+        return Pipeline, ProgressHook
+    except ImportError as error:
+        raise RuntimeError(
+            "No se pudo importar pyannote.audio. "
+            "Instala las dependencias con: python -m pip install -r requirements.txt"
+        ) from error
+
+
 SUPPORTED_FORMATS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".wma", ".aac", ".mp4"}
 PYANNOTE_NATIVE_FORMATS = {".wav", ".flac", ".ogg"}
 
 
 ProgressCallback = Callable[[Dict[str, Any]], None]
+CancelCheck = Callable[[], bool]
+
+
+class TranscriptionCancelled(Exception):
+    """Se lanza cuando el usuario cancela el proceso en curso."""
 
 
 class StageLogger:
@@ -85,6 +98,8 @@ class StageLogger:
         percent: Optional[int],
         message: str = "",
         stage_name: Optional[str] = None,
+        eta_seconds: Optional[float] = None,
+        indeterminate: bool = False,
     ) -> None:
         if not self.progress_callback:
             return
@@ -95,6 +110,11 @@ class StageLogger:
             "total_stages": self.total_steps,
             "percent": percent,
             "message": message,
+            "eta_seconds": eta_seconds,
+            # True solo en fases largas sin porcentaje (carga de modelo, etc.),
+            # para que la GUI muestre una barra animada. Los mensajes de log
+            # normales (percent=None pero indeterminate=False) no la activan.
+            "indeterminate": indeterminate,
         }
         self.progress_callback(event)
 
@@ -230,191 +250,83 @@ def ensure_dependency(module: Any, package_name: str, install_hint: str) -> None
         )
 
 
-def sha256_file(path: Path) -> str:
-    hasher = hashlib.sha256()
-    with open(path, "rb") as file:
-        for chunk in iter(lambda: file.read(1024 * 1024), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
-
-
-def ensure_whisper_model(model_size: str, models_dir: Path, logger: StageLogger) -> None:
-    """Descarga el modelo Whisper con progreso controlado por la aplicacion."""
-    model_urls = getattr(whisper, "_MODELS", {})
-    model_url = model_urls.get(model_size)
-
-    if not model_url:
-        logger.info("No se pudo obtener URL interna del modelo; Whisper usara su descarga por defecto", always=True)
-        return
-
-    target = models_dir / os.path.basename(model_url)
-    expected_sha256 = model_url.split("/")[-2] if "/" in model_url else None
-
-    if target.exists():
-        logger.progress(15, "Verificando modelo local")
-        if not expected_sha256 or sha256_file(target) == expected_sha256:
-            logger.info(f"Modelo local encontrado: {target.name} ({format_bytes(target.stat().st_size)})", always=True)
-            logger.progress(85, "Modelo local listo")
-            return
-
-        logger.info(f"Modelo local incompleto o corrupto: {target.name}. Se descargara nuevamente.", always=True)
-        target.unlink()
-
-    temp_target = target.with_suffix(target.suffix + ".download")
-    if temp_target.exists():
-        temp_target.unlink()
-
-    logger.info(f"Descargando modelo {model_size}: {target.name}", always=True)
-    start_time = time.perf_counter()
-    last_logged_percent = -5
-    downloaded = 0
-
-    with urllib.request.urlopen(model_url) as source, open(temp_target, "wb") as output:
-        total_size = int(source.info().get("Content-Length") or 0)
-        if total_size:
-            logger.info(f"Tamano total: {format_bytes(total_size)}", always=True)
-
-        while True:
-            chunk = source.read(1024 * 1024)
-            if not chunk:
-                break
-
-            output.write(chunk)
-            downloaded += len(chunk)
-            elapsed = max(time.perf_counter() - start_time, 0.001)
-            speed = downloaded / elapsed
-
-            if total_size:
-                percent = int(downloaded / total_size * 100)
-                logger.progress(percent, "")
-
-                if percent >= last_logged_percent + 5 or percent == 100:
-                    logger.info(
-                        f"Descarga {percent}% | {format_bytes(downloaded)}/{format_bytes(total_size)} | {format_bytes(speed)}/s",
-                        always=True,
-                    )
-                    last_logged_percent = percent
-            else:
-                logger.progress(None, f"Descargado {format_bytes(downloaded)} | {format_bytes(speed)}/s")
-
-    logger.progress(98, "Verificando descarga")
-    if expected_sha256 and sha256_file(temp_target) != expected_sha256:
-        temp_target.unlink(missing_ok=True)
-        raise RuntimeError("La descarga del modelo no coincide con el checksum esperado")
-
-    temp_target.replace(target)
-    logger.info(f"Modelo guardado en: {target}", always=True)
-
-
-class WhisperProgressBar:
-    """Adapta el progreso interno de Whisper a StageLogger."""
-
-    def __init__(
-        self,
-        original_tqdm: Any,
-        logger: StageLogger,
-        show_terminal_progress: bool,
-        *args: Any,
-        **kwargs: Any,
-    ):
-        self.logger = logger
-        self.total = int(kwargs.get("total") or 0)
-        self.n = int(kwargs.get("initial") or 0)
-        self.start_time = time.perf_counter()
-        self.last_logged_percent = -5
-        self.last_emit_time = 0.0
-        self.real_bar = original_tqdm(*args, **kwargs) if show_terminal_progress else None
-
-    def __enter__(self) -> "WhisperProgressBar":
-        if self.real_bar:
-            self.real_bar.__enter__()
-        return self
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        if self.real_bar:
-            self.real_bar.__exit__(exc_type, exc, tb)
-
-    def update(self, amount: int = 1) -> None:
-        if self.real_bar:
-            self.real_bar.update(amount)
-            self.n = int(getattr(self.real_bar, "n", self.n + amount))
-        else:
-            self.n += amount
-
-        self._emit_progress()
-
-    def close(self) -> None:
-        if self.real_bar:
-            self.real_bar.close()
-
-    def set_description(self, *args: Any, **kwargs: Any) -> None:
-        if self.real_bar:
-            self.real_bar.set_description(*args, **kwargs)
-
-    def set_postfix(self, *args: Any, **kwargs: Any) -> None:
-        if self.real_bar:
-            self.real_bar.set_postfix(*args, **kwargs)
-
-    def _emit_progress(self) -> None:
-        if self.total <= 0:
-            self.logger.progress(None, f"Frames procesados: {self.n}")
-            return
-
-        percent = min(100, int(self.n / self.total * 100))
-        self.logger.progress(percent, "")
-
-        now = time.perf_counter()
-        if percent < self.last_logged_percent + 5 and now - self.last_emit_time < 2:
-            return
-
-        elapsed = max(now - self.start_time, 0.001)
-        rate = self.n / elapsed
-        remaining_frames = max(self.total - self.n, 0)
-        remaining_seconds = remaining_frames / rate if rate > 0 else None
-
-        self.logger.info(
-            f"Transcripcion {self.n}/{self.total} "
-            f"[{format_seconds(elapsed)}<{format_seconds(remaining_seconds)}, {rate:.2f}frames/s]",
-            always=True,
-        )
-        self.last_logged_percent = percent
-        self.last_emit_time = now
-
-    def __getattr__(self, name: str) -> Any:
-        if self.real_bar:
-            return getattr(self.real_bar, name)
-        raise AttributeError(name)
-
-
-def transcribe_with_progress(
+def transcribe_with_faster_whisper(
     model: Any,
     audio_file_path: str,
     transcribe_options: Dict[str, Any],
+    total_audio_seconds: Optional[float],
     logger: StageLogger,
     show_terminal_progress: bool,
+    should_cancel: Optional[CancelCheck] = None,
 ) -> Dict[str, Any]:
-    """Ejecuta Whisper conectando su progreso interno a la GUI."""
-    try:
-        transcribe_module = importlib.import_module("whisper.transcribe")
-        original_tqdm = transcribe_module.tqdm.tqdm
-    except Exception:
-        return model.transcribe(audio_file_path, **transcribe_options)
+    """Ejecuta faster-whisper, transmitiendo progreso y ETA a la GUI.
 
-    def progress_factory(*args: Any, **kwargs: Any) -> WhisperProgressBar:
-        return WhisperProgressBar(original_tqdm, logger, show_terminal_progress, *args, **kwargs)
+    faster-whisper devuelve un generador de segmentos; el trabajo real ocurre
+    al iterarlo. Aprovechamos eso para emitir porcentaje y tiempo restante en
+    funcion del avance temporal del audio.
+    """
+    segments_gen, info = model.transcribe(audio_file_path, **transcribe_options)
 
-    transcribe_module.tqdm.tqdm = progress_factory
-    try:
-        return model.transcribe(audio_file_path, **transcribe_options)
-    finally:
-        transcribe_module.tqdm.tqdm = original_tqdm
+    total_seconds = total_audio_seconds or getattr(info, "duration", None) or 0
+    detected_language = getattr(info, "language", None)
+
+    # El trabajo real ocurre al consumir el generador; hasta el primer segmento
+    # no hay porcentaje, asi que mostramos avance indeterminado (animado).
+    logger.progress(None, "Detectando voz y transcribiendo...", indeterminate=True)
+
+    collected_segments: List[Dict[str, Any]] = []
+    text_parts: List[str] = []
+    start_time = time.perf_counter()
+    last_logged_percent = -5
+    last_emit_time = 0.0
+
+    for segment in segments_gen:
+        if should_cancel and should_cancel():
+            raise TranscriptionCancelled("Transcripcion cancelada por el usuario")
+
+        collected_segments.append({
+            "start": float(segment.start),
+            "end": float(segment.end),
+            "text": segment.text,
+        })
+        text_parts.append(segment.text)
+
+        processed = float(segment.end)
+        elapsed = max(time.perf_counter() - start_time, 0.001)
+
+        if total_seconds:
+            percent = max(0, min(100, int(processed / total_seconds * 100)))
+            rate = processed / elapsed
+            eta_seconds = (total_seconds - processed) / rate if rate > 0 else None
+            logger.progress(percent, "", eta_seconds=eta_seconds)
+
+            now = time.perf_counter()
+            if show_terminal_progress and (
+                percent >= last_logged_percent + 5 or now - last_emit_time >= 2
+            ):
+                logger.info(
+                    f"Transcripcion {format_seconds(processed)}/{format_seconds(total_seconds)} "
+                    f"[ETA {format_seconds(eta_seconds)}, {rate:.2f}x]",
+                    always=True,
+                )
+                last_logged_percent = percent
+                last_emit_time = now
+        else:
+            logger.progress(None, f"Segmentos procesados: {len(collected_segments)}")
+
+    return {
+        "segments": collected_segments,
+        "text": "".join(text_parts).strip(),
+        "language": detected_language,
+    }
 
 
 class PyannoteProgressHook:
     """Envia a la GUI el progreso real reportado por pyannote."""
 
-    def __init__(self, logger: StageLogger):
+    def __init__(self, logger: StageLogger, should_cancel: Optional[CancelCheck] = None):
         self.logger = logger
+        self.should_cancel = should_cancel
         self.last_percent = -1
         self.last_message_at = 0.0
         self.last_step_name = None
@@ -436,6 +348,9 @@ class PyannoteProgressHook:
         return aliases.get(normalized.lower(), normalized.replace("_", " ").title())
 
     def __call__(self, *args: Any, **kwargs: Any) -> None:
+        if self.should_cancel and self.should_cancel():
+            raise TranscriptionCancelled("Diarizacion cancelada por el usuario")
+
         completed = kwargs.get("completed")
         total = kwargs.get("total")
         step_name = kwargs.get("step_name") or kwargs.get("name")
@@ -483,13 +398,21 @@ def diarize_audio(
     show_progress: bool = True,
     num_speakers: Optional[int] = None,
     logger: Optional[StageLogger] = None,
+    prepared_audio_path: Optional[str] = None,
+    should_cancel: Optional[CancelCheck] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Realizar diarizacion de speakers usando pyannote.audio."""
+    """Realizar diarizacion de speakers usando pyannote.audio.
+
+    Si ``prepared_audio_path`` viene dado, se reutiliza ese WAV ya convertido
+    (16 kHz mono) en vez de volver a decodificar el audio; en ese caso la
+    limpieza del temporal es responsabilidad de quien llama.
+    """
     temp_audio_path = None
     try:
         ensure_dependency(torch, "torch", "python -m pip install -r requirements.txt")
-        ensure_dependency(Pipeline, "pyannote.audio", "python -m pip install -r requirements.txt")
-        ensure_dependency(ProgressHook, "pyannote.audio ProgressHook", "python -m pip install -r requirements.txt")
+        if logger:
+            logger.progress(None, "Cargando modelos de diarizacion (la primera vez puede tardar)", indeterminate=True)
+        Pipeline, ProgressHook = _load_pyannote()
 
         pipeline = None
         selected_pipeline = None
@@ -535,14 +458,17 @@ def diarize_audio(
             if num_speakers:
                 logger.info(f"Numero de hablantes fijado: {num_speakers}", always=True)
 
-        audio_for_diarization, temp_audio_path = prepare_audio_for_pyannote(audio_file_path, logger)
+        if prepared_audio_path:
+            audio_for_diarization = prepared_audio_path
+        else:
+            audio_for_diarization, temp_audio_path = prepare_audio_for_pyannote(audio_file_path, logger)
 
         diarization_input: Dict[str, Any] = {"audio": audio_for_diarization}
         if num_speakers:
             diarization_input["num_speakers"] = num_speakers
 
         if logger:
-            with PyannoteProgressHook(logger) as hook:
+            with PyannoteProgressHook(logger, should_cancel=should_cancel) as hook:
                 diarization = pipeline(diarization_input, hook=hook)
         elif show_progress:
             with ProgressHook() as hook:
@@ -576,6 +502,8 @@ def diarize_audio(
             "speaker_stats": speaker_stats
         }
 
+    except TranscriptionCancelled:
+        raise
     except Exception as e:
         print(f"Error en diarizacion: {e}")
         print("Nota: La diarizacion requiere pyannote.audio, acceso al modelo y token de Hugging Face")
@@ -659,6 +587,7 @@ def transcribe_audio_with_diarization(
     num_speakers: Optional[int] = None,
     verbose: bool = False,
     progress_callback: Optional[ProgressCallback] = None,
+    should_cancel: Optional[CancelCheck] = None,
 ) -> Dict[str, Any]:
     """Transcribir audio y, opcionalmente, identificar speakers."""
     total_steps = 8 if enable_diarization else 6
@@ -668,130 +597,163 @@ def transcribe_audio_with_diarization(
         progress_callback=progress_callback,
     )
 
-    logger.start("Validando archivo de audio")
-    if not os.path.exists(audio_file_path):
-        raise FileNotFoundError(f"El archivo {audio_file_path} no existe")
+    def check_cancel() -> None:
+        if should_cancel and should_cancel():
+            raise TranscriptionCancelled("Proceso cancelado por el usuario")
 
-    file_extension = Path(audio_file_path).suffix.lower()
-    if file_extension not in SUPPORTED_FORMATS:
-        logger.info(f"Advertencia: el formato {file_extension} puede no ser compatible", always=True)
-        logger.info(f"Formatos esperados: {', '.join(sorted(SUPPORTED_FORMATS))}", always=True)
+    # WAV temporal (16 kHz mono) que se reutiliza entre transcripcion y
+    # diarizacion; se limpia al final pase lo que pase.
+    diarization_temp = None
 
-    file_size_mb = os.path.getsize(audio_file_path) / (1024 * 1024)
-    logger.info(f"Archivo: {audio_file_path}", always=True)
-    logger.info(f"Tamano: {file_size_mb:.2f} MB")
-    logger.done("Archivo validado")
+    try:
+        logger.start("Validando archivo de audio")
+        check_cancel()
+        if not os.path.exists(audio_file_path):
+            raise FileNotFoundError(f"El archivo {audio_file_path} no existe")
 
-    logger.start("Detectando hardware")
-    ensure_dependency(torch, "torch", "python -m pip install -r requirements.txt")
-    ensure_dependency(whisper, "openai-whisper", "python -m pip install -r requirements.txt")
-    device = get_runtime_device()
-    cuda_name = get_cuda_name()
-    use_fp16 = device == "cuda"
+        file_extension = Path(audio_file_path).suffix.lower()
+        if file_extension not in SUPPORTED_FORMATS:
+            logger.info(f"Advertencia: el formato {file_extension} puede no ser compatible", always=True)
+            logger.info(f"Formatos esperados: {', '.join(sorted(SUPPORTED_FORMATS))}", always=True)
 
-    logger.info(f"Dispositivo: {device.upper()}", always=True)
-    if cuda_name:
-        logger.info(f"GPU: {cuda_name}", always=True)
-    logger.info(f"fp16: {'activado' if use_fp16 else 'desactivado'}", always=True)
-    logger.done("Hardware detectado")
+        file_size_mb = os.path.getsize(audio_file_path) / (1024 * 1024)
+        logger.info(f"Archivo: {audio_file_path}", always=True)
+        logger.info(f"Tamano: {file_size_mb:.2f} MB")
+        logger.done("Archivo validado")
 
-    logger.start("Analizando duracion del audio")
-    audio_duration = get_audio_duration(audio_file_path)
-    if audio_duration:
-        logger.info(f"Duracion: {format_seconds(audio_duration)}", always=True)
-    else:
-        logger.info("No se pudo obtener la duracion con ffprobe", always=True)
-    logger.done("Duracion analizada")
+        logger.start("Detectando hardware")
+        ensure_dependency(WhisperModel, "faster-whisper", "python -m pip install -r requirements.txt")
+        device = get_runtime_device()
+        cuda_name = get_cuda_name()
+        use_fp16 = device == "cuda"
+        compute_type = "float16" if device == "cuda" else "int8"
+        cpu_threads = os.cpu_count() or 4
 
-    logger.start(f"Cargando modelo Whisper '{model_size}'")
-    logger.progress(10, "Preparando carga del modelo")
-    models_dir = Path(__file__).resolve().parent / "models"
-    models_dir.mkdir(exist_ok=True)
-    logger.info(f"Carpeta de modelos: {models_dir}", always=True)
-    ensure_whisper_model(model_size, models_dir, logger)
-    logger.progress(99, "Inicializando modelo en memoria")
-    model = whisper.load_model(model_size, device=device, download_root=str(models_dir))
-    logger.done("Modelo cargado")
+        logger.info(f"Dispositivo: {device.upper()}", always=True)
+        if cuda_name:
+            logger.info(f"GPU: {cuda_name}", always=True)
+        logger.info(f"compute_type: {compute_type}", always=True)
+        if device == "cpu":
+            logger.info(f"Hilos CPU: {cpu_threads}", always=True)
+        logger.done("Hardware detectado")
 
-    logger.start("Transcribiendo audio")
-    logger.progress(5, "Preparando transcripcion")
-    transcribe_options = {
-        "fp16": use_fp16,
-        "verbose": show_progress,
-    }
+        logger.start("Analizando duracion del audio")
+        audio_duration = get_audio_duration(audio_file_path)
+        if audio_duration:
+            logger.info(f"Duracion: {format_seconds(audio_duration)}", always=True)
+        else:
+            logger.info("No se pudo obtener la duracion con ffprobe", always=True)
+        logger.done("Duracion analizada")
 
-    if language:
-        transcribe_options["language"] = language
-        logger.info(f"Idioma fijado: {language}", always=True)
-    else:
-        logger.info("Idioma no fijado: Whisper lo detectara automaticamente", always=True)
+        # Decodificar una sola vez: si habra diarizacion, convertimos a WAV
+        # 16 kHz mono y reutilizamos ese mismo archivo para faster-whisper y
+        # pyannote, evitando decodificar el audio de origen dos veces.
+        working_audio = audio_file_path
+        if enable_diarization:
+            working_audio, diarization_temp = prepare_audio_for_pyannote(audio_file_path, logger)
 
-    result = transcribe_with_progress(
-        model,
-        audio_file_path,
-        transcribe_options,
-        logger,
-        show_terminal_progress=show_progress,
-    )
-    logger.progress(95, "Procesando segmentos de Whisper")
-    segment_count = len(result.get("segments", []))
-    result["device"] = device
-    result["fp16"] = use_fp16
-    logger.info(f"Idioma detectado: {result.get('language', 'desconocido')}", always=True)
-    logger.info(f"Segmentos generados: {segment_count}", always=True)
-    logger.done("Transcripcion completada")
-
-    diarization_result = None
-    if enable_diarization:
-        logger.start("Diarizando hablantes")
-        if not hf_token:
-            raise ValueError("Debe proporcionar --hf-token o configurar la variable de entorno HF_TOKEN para usar --diarize")
-
-        diarization_result = diarize_audio(
-            audio_file_path,
-            hf_token=hf_token,
+        logger.start(f"Cargando modelo Whisper '{model_size}'")
+        check_cancel()
+        models_dir = Path(__file__).resolve().parent / "models"
+        models_dir.mkdir(exist_ok=True)
+        logger.info(f"Carpeta de modelos: {models_dir}", always=True)
+        logger.progress(None, "Descargando/cargando modelo (la primera vez puede tardar)", indeterminate=True)
+        model = WhisperModel(
+            model_size,
             device=device,
-            show_progress=show_progress,
-            num_speakers=num_speakers,
-            logger=logger
+            compute_type=compute_type,
+            cpu_threads=cpu_threads,
+            download_root=str(models_dir),
         )
+        logger.done("Modelo cargado")
 
-        if diarization_result:
-            logger.info(f"Speakers detectados: {len(diarization_result['speakers'])}", always=True)
-            for speaker, stats in diarization_result["speaker_stats"].items():
-                logger.info(f"{speaker}: {format_seconds(stats['total_time'])} en {stats['segments']} segmentos", always=True)
-            logger.done("Diarizacion completada")
+        logger.start("Transcribiendo audio")
+        check_cancel()
+        logger.progress(0, "Preparando transcripcion")
+        transcribe_options: Dict[str, Any] = {
+            "beam_size": 5,
+            "vad_filter": True,
+        }
+
+        if language:
+            transcribe_options["language"] = language
+            logger.info(f"Idioma fijado: {language}", always=True)
         else:
-            logger.done("Diarizacion omitida por error")
+            logger.info("Idioma no fijado: se detectara automaticamente", always=True)
 
-        logger.start("Asignando speakers a la transcripcion")
-        if diarization_result and diarization_result["segments"]:
-            result["segments"] = assign_speaker_to_transcription(
-                result["segments"],
-                diarization_result["segments"],
+        result = transcribe_with_faster_whisper(
+            model,
+            working_audio,
+            transcribe_options,
+            total_audio_seconds=audio_duration,
+            logger=logger,
+            show_terminal_progress=show_progress,
+            should_cancel=should_cancel,
+        )
+        result["device"] = device
+        result["fp16"] = use_fp16
+        logger.info(f"Idioma detectado: {result.get('language') or 'desconocido'}", always=True)
+        logger.info(f"Segmentos generados: {len(result.get('segments', []))}", always=True)
+        logger.done("Transcripcion completada")
+
+        diarization_result = None
+        if enable_diarization:
+            logger.start("Diarizando hablantes")
+            check_cancel()
+            if not hf_token:
+                raise ValueError("Debe proporcionar --hf-token o configurar la variable de entorno HF_TOKEN para usar --diarize")
+
+            diarization_result = diarize_audio(
+                audio_file_path,
+                hf_token=hf_token,
+                device=device,
                 show_progress=show_progress,
-                logger=logger
+                num_speakers=num_speakers,
+                logger=logger,
+                prepared_audio_path=working_audio,
+                should_cancel=should_cancel,
             )
-            logger.done("Speakers asignados")
+
+            if diarization_result:
+                logger.info(f"Speakers detectados: {len(diarization_result['speakers'])}", always=True)
+                for speaker, stats in diarization_result["speaker_stats"].items():
+                    logger.info(f"{speaker}: {format_seconds(stats['total_time'])} en {stats['segments']} segmentos", always=True)
+                logger.done("Diarizacion completada")
+            else:
+                logger.done("Diarizacion omitida por error")
+
+            logger.start("Asignando speakers a la transcripcion")
+            check_cancel()
+            if diarization_result and diarization_result["segments"]:
+                result["segments"] = assign_speaker_to_transcription(
+                    result["segments"],
+                    diarization_result["segments"],
+                    show_progress=show_progress,
+                    logger=logger
+                )
+                logger.done("Speakers asignados")
+            else:
+                logger.done("No hay segmentos de diarizacion para asignar")
+
+        result["diarization"] = diarization_result
+
+        logger.start("Guardando salida y finalizando")
+        if output_file:
+            logger.progress(20, "Escribiendo archivos")
+            save_transcription_with_speakers(result, output_file)
+            base_path = Path(output_file).with_suffix("")
+            logger.info(f"Texto: {base_path}.txt", always=True)
+            logger.info(f"Detalle: {base_path}_detailed.txt", always=True)
+            logger.info(f"JSON: {base_path}.json", always=True)
+            logger.done("Archivos guardados")
         else:
-            logger.done("No hay segmentos de diarizacion para asignar")
+            logger.done("Salida lista en memoria")
 
-    result["diarization"] = diarization_result
-
-    logger.start("Guardando salida y finalizando")
-    if output_file:
-        logger.progress(20, "Escribiendo archivos")
-        save_transcription_with_speakers(result, output_file)
-        base_path = Path(output_file).with_suffix("")
-        logger.info(f"Texto: {base_path}.txt", always=True)
-        logger.info(f"Detalle: {base_path}_detailed.txt", always=True)
-        logger.info(f"JSON: {base_path}.json", always=True)
-        logger.done("Archivos guardados")
-    else:
-        logger.done("Salida lista en memoria")
-
-    logger.summary()
-    return result
+        logger.summary()
+        return result
+    finally:
+        if diarization_temp:
+            Path(diarization_temp).unlink(missing_ok=True)
 
 
 def save_transcription_with_speakers(result: Dict[str, Any], output_file: str) -> None:
