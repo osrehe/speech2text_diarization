@@ -1,5 +1,7 @@
 import os
 import queue
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -8,8 +10,31 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
 from typing import Any, Dict, Optional
 
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except ImportError:
+    DND_FILES = None
+    TkinterDnD = None
+
 ENV_PATH = Path(__file__).resolve().parent / ".env"
+OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 SUPPORTED_FORMATS = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".wma", ".aac", ".mp4"}
+
+
+def format_eta(seconds: Optional[float]) -> str:
+    """Formato breve de tiempo restante (replica ligera de transcriber_dia)."""
+    if seconds is None or seconds < 0:
+        return "desconocido"
+
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+
+    minutes, remaining = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{remaining:02d}"
+    return f"{minutes:02d}:{remaining:02d}"
 
 
 class TranscriberGUI:
@@ -21,7 +46,9 @@ class TranscriberGUI:
 
         self.events: queue.Queue[Dict[str, Any]] = queue.Queue()
         self.worker: Optional[threading.Thread] = None
+        self.cancel_event = threading.Event()
         self.running = False
+        self._indeterminate = False
         self.current_percent = 0
         self.current_stage_index = 0
         self.current_stage_name = ""
@@ -118,6 +145,7 @@ class TranscriberGUI:
         file_menu = tk.Menu(menubar, tearoff=0)
         file_menu.add_command(label="Abrir audio", command=self._select_audio)
         file_menu.add_command(label="Guardar salida", command=self._save_visible_result)
+        file_menu.add_command(label="Abrir carpeta de salida", command=self._open_output_folder)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.root.destroy)
         menubar.add_cascade(label="Archivo", menu=file_menu)
@@ -179,7 +207,9 @@ class TranscriberGUI:
         options.pack(fill=tk.X, pady=(0, 12))
 
         ttk.Label(options, text="Audio", style="Card.TLabel").grid(row=0, column=0, sticky=tk.W, padx=(0, 8), pady=6)
-        ttk.Entry(options, textvariable=self.audio_path).grid(row=0, column=1, columnspan=4, sticky=tk.EW, pady=4)
+        self.audio_entry = ttk.Entry(options, textvariable=self.audio_path)
+        self.audio_entry.grid(row=0, column=1, columnspan=4, sticky=tk.EW, pady=4)
+        self._register_drop_target(self.audio_entry)
         ttk.Button(
             options,
             text="Seleccionar",
@@ -232,7 +262,16 @@ class TranscriberGUI:
 
         self.start_button = ttk.Button(actions, text="Procesar audio", command=self._start_processing, style="Primary.TButton")
         self.start_button.pack(side=tk.LEFT)
+        self.cancel_button = ttk.Button(
+            actions,
+            text="Cancelar",
+            command=self._cancel_processing,
+            state=tk.DISABLED,
+            style="Secondary.TButton",
+        )
+        self.cancel_button.pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(actions, text="Limpiar", command=self._clear_output, style="Secondary.TButton").pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(actions, text="Abrir carpeta", command=self._open_output_folder, style="Secondary.TButton").pack(side=tk.LEFT, padx=(8, 0))
         self.copy_button = ttk.Button(
             actions,
             text="Copiar transcripcion",
@@ -302,9 +341,42 @@ class TranscriberGUI:
         if not path:
             return
 
+        self._set_audio_path(path)
+
+    def _set_audio_path(self, path: str) -> None:
         self.audio_path.set(path)
         output_path = self._build_output_path(path)
         self.output_hint.configure(text=f"Salida: {output_path.parent.name}/{output_path.name}")
+
+    def _register_drop_target(self, widget: tk.Widget) -> None:
+        """Habilita arrastrar y soltar un archivo si tkinterdnd2 esta disponible."""
+        if DND_FILES is None or not hasattr(widget, "drop_target_register"):
+            return
+        widget.drop_target_register(DND_FILES)
+        widget.dnd_bind("<<Drop>>", self._on_drop)
+
+    def _on_drop(self, event: Any) -> None:
+        # tkinterdnd2 entrega rutas separadas por espacios y, si contienen
+        # espacios, encerradas en llaves: "{C:\\ruta con espacios.m4a}".
+        data = event.data.strip()
+        if data.startswith("{") and "}" in data:
+            path = data[1:data.index("}")]
+        else:
+            path = data.split(" ")[0]
+        if path:
+            self._set_audio_path(path)
+
+    def _open_output_folder(self) -> None:
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(OUTPUT_DIR)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(OUTPUT_DIR)])
+            else:
+                subprocess.Popen(["xdg-open", str(OUTPUT_DIR)])
+        except Exception as exc:
+            messagebox.showwarning("Abrir carpeta", f"No se pudo abrir la carpeta:\n{exc}")
 
     def _build_output_path(self, audio_path: str) -> Path:
         output_dir = Path(__file__).resolve().parent / "output"
@@ -417,11 +489,13 @@ class TranscriberGUI:
             return
 
         self._clear_output()
+        self.cancel_event.clear()
         self.running = True
         self.current_percent = 0
         self.current_stage_index = 0
         self.current_stage_name = ""
         self.start_button.configure(state=tk.DISABLED)
+        self.cancel_button.configure(state=tk.NORMAL)
         self.stage_label.configure(text="Iniciando proceso...")
         self._set_progress(0)
         self.last_progress_at = time.time()
@@ -444,10 +518,19 @@ class TranscriberGUI:
                 "num_speakers": num_speakers,
                 "verbose": True,
                 "progress_callback": self._progress_callback,
+                "should_cancel": self.cancel_event.is_set,
             },
             daemon=True,
         )
         self.worker.start()
+
+    def _cancel_processing(self) -> None:
+        if not self.running:
+            return
+        self.cancel_event.set()
+        self.cancel_button.configure(state=tk.DISABLED)
+        self.stage_label.configure(text="Cancelando...")
+        self._append_log("Solicitando cancelacion del proceso...")
 
     def _parse_num_speakers(self) -> Optional[int]:
         value = self.num_speakers.get().strip()
@@ -459,28 +542,57 @@ class TranscriberGUI:
             return None
         return parsed if parsed > 0 else None
 
+    def _emit_prep(self, message: str, percent: Optional[int] = None) -> None:
+        """Emite avance de la etapa de carga del motor (indice 0)."""
+        self.events.put({
+            "type": "progress",
+            "stage_name": "Preparando motor de procesamiento",
+            "stage_index": 0,
+            "total_stages": 0,
+            "percent": percent,
+            "message": message,
+            "eta_seconds": None,
+            "indeterminate": percent is None,
+        })
+
     def _run_transcription(self, **kwargs: Any) -> None:
         try:
-            self.events.put({
-                "type": "progress",
-                "stage_name": "Preparando motor de procesamiento",
-                "stage_index": 0,
-                "total_stages": 0,
-                "percent": 0,
-                "message": "Cargando dependencias de Whisper y diarizacion...",
-            })
-            from transcriber_dia import transcribe_audio_with_diarization
+            # Importar las librerias pesadas paso a paso, informando al usuario
+            # en cada una. Son los imports que antes dejaban la GUI "congelada"
+            # sin feedback. El import se hace best-effort: si falta una
+            # dependencia, el motor levantara el error claro al validarla.
+            enable_diarization = kwargs.get("enable_diarization")
 
-            self.events.put({
-                "type": "progress",
-                "stage_name": "Preparando motor de procesamiento",
-                "stage_index": 0,
-                "total_stages": 0,
-                "percent": 100,
-                "message": "Motor de procesamiento cargado.",
-            })
+            self._emit_prep("Cargando PyTorch (puede tardar unos segundos)...")
+            try:
+                import torch  # noqa: F401
+            except Exception:
+                pass
+
+            self._emit_prep("Cargando motor de transcripcion (faster-whisper)...")
+            try:
+                import faster_whisper  # noqa: F401
+            except Exception:
+                pass
+
+            if enable_diarization:
+                self._emit_prep("Cargando modelos de diarizacion (pyannote)...")
+                try:
+                    import pyannote.audio  # noqa: F401
+                except Exception:
+                    pass
+
+            self._emit_prep("Inicializando motor...")
+            from transcriber_dia import (
+                TranscriptionCancelled,
+                transcribe_audio_with_diarization,
+            )
+
+            self._emit_prep("Motor de procesamiento cargado.", 100)
             result = transcribe_audio_with_diarization(**kwargs)
             self.events.put({"type": "result", "result": result})
+        except TranscriptionCancelled:
+            self.events.put({"type": "cancelled"})
         except Exception as exc:
             self.events.put({"type": "error", "message": str(exc)})
 
@@ -499,6 +611,8 @@ class TranscriberGUI:
                 self._handle_progress(event)
             elif event_type == "result":
                 self._handle_result(event["result"])
+            elif event_type == "cancelled":
+                self._handle_cancelled()
             elif event_type == "error":
                 self._handle_error(event["message"])
 
@@ -510,6 +624,8 @@ class TranscriberGUI:
         total_stages = int(event.get("total_stages") or 0)
         percent = event.get("percent")
         message = event.get("message") or ""
+        eta_seconds = event.get("eta_seconds")
+        indeterminate = bool(event.get("indeterminate"))
 
         if stage_index and stage_index != self.current_stage_index:
             self.current_stage_index = stage_index
@@ -519,14 +635,24 @@ class TranscriberGUI:
             self.current_stage_name = stage_name
 
         if stage_index and total_stages:
-            self.stage_label.configure(text=f"{stage_name} ({stage_index}/{total_stages})")
+            label = f"{stage_name} ({stage_index}/{total_stages})"
         else:
-            self.stage_label.configure(text=stage_name)
+            label = stage_name
 
-        if percent is not None:
-            percent = int(percent)
-            self._set_progress(percent)
+        if eta_seconds is not None and percent not in (None, 100):
+            label = f"{label} · restan {format_eta(eta_seconds)}"
+
+        self.stage_label.configure(text=label)
+
+        if indeterminate:
+            # Fase larga sin porcentaje: barra animada para indicar actividad.
+            self._set_indeterminate(True)
+        elif percent is not None:
+            self._set_indeterminate(False)
+            self._set_progress(int(percent))
             self.last_progress_at = time.time()
+        # percent None y no indeterminate: solo es un mensaje de log; la barra
+        # se deja como esta para no provocar parpadeo.
 
         if message:
             self._append_log(message)
@@ -534,6 +660,7 @@ class TranscriberGUI:
     def _handle_result(self, result: Dict[str, Any]) -> None:
         self.running = False
         self.start_button.configure(state=tk.NORMAL)
+        self.cancel_button.configure(state=tk.DISABLED)
         self.stage_label.configure(text="Proceso completado")
         self._set_progress(100)
         self._append_log("Proceso finalizado correctamente.")
@@ -542,14 +669,38 @@ class TranscriberGUI:
         self.result_text.insert(tk.END, self.last_result_text)
         self.copy_button.configure(state=tk.NORMAL)
 
+    def _handle_cancelled(self) -> None:
+        self.running = False
+        self.start_button.configure(state=tk.NORMAL)
+        self.cancel_button.configure(state=tk.DISABLED)
+        self.stage_label.configure(text="Proceso cancelado")
+        self._set_progress(0)
+        self._append_log("Proceso cancelado por el usuario.")
+
     def _handle_error(self, message: str) -> None:
         self.running = False
         self.start_button.configure(state=tk.NORMAL)
+        self.cancel_button.configure(state=tk.DISABLED)
+        self._set_indeterminate(False)
         self.stage_label.configure(text="Proceso detenido por error")
         self._append_log(f"ERROR: {message}")
         messagebox.showerror("Error", message)
 
+    def _set_indeterminate(self, active: bool) -> None:
+        """Activa/desactiva la barra animada (modo indeterminado)."""
+        if active and not self._indeterminate:
+            self.progress.configure(mode="indeterminate")
+            self.progress.start(12)
+            self._indeterminate = True
+            self.percent_label.configure(text="...")
+        elif not active and self._indeterminate:
+            self.progress.stop()
+            self.progress.configure(mode="determinate")
+            self._indeterminate = False
+
     def _set_progress(self, percent: int) -> None:
+        if self._indeterminate:
+            self._set_indeterminate(False)
         percent = max(0, min(100, int(percent)))
         self.current_percent = percent
         self.progress.configure(value=percent)
@@ -596,8 +747,11 @@ class TranscriberGUI:
 
 
 def main() -> None:
-    root = tk.Tk()
-    TranscriberGUI(root)
+    # TkinterDnD.Tk() habilita arrastrar y soltar; si la libreria no esta
+    # instalada, la GUI funciona igual con la raiz estandar de Tk.
+    root = TkinterDnD.Tk() if TkinterDnD is not None else tk.Tk()
+    app = TranscriberGUI(root)
+    app._register_drop_target(root)
     root.mainloop()
 
 

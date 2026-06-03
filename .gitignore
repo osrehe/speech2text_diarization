@@ -3,6 +3,10 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Speech2Text: modelos Whisper descargados y resultados generados
+models/
+output/
+
 # C extensions
 *.so
 

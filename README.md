@@ -57,21 +57,30 @@ python -m pip install -r requirements.txt
 
 ## Uso con Interfaz Grafica
 
-Ejecutar:
+Ejecutar (con el ambiente virtual activado):
 
 ```powershell
 python transcriber_gui.py
 ```
 
+### Inicio rapido con `Iniciar_GUI.bat`
+
+En Windows puedes hacer **doble clic** en `Iniciar_GUI.bat` para abrir la GUI directamente. El archivo usa el Python del entorno virtual `whisper_env` (no el Python global), de modo que las dependencias como `faster-whisper` esten disponibles.
+
+Esto evita el error `No se pudo importar faster-whisper`, que ocurre cuando la GUI se lanza con un Python que no tiene instaladas las dependencias (por ejemplo, al hacer doble clic en `transcriber_gui.py`, que Windows abre con el Python global).
+
+Si el entorno `whisper_env` no existe, el `.bat` muestra las instrucciones para crearlo. Opcionalmente puedes crear un acceso directo del `.bat` en el escritorio.
+
 La GUI permite:
 
-- Seleccionar un archivo de audio o video.
+- Seleccionar un archivo de audio o video, o arrastrarlo y soltarlo sobre la ventana (requiere `tkinterdnd2`).
 - Elegir modelo Whisper: `tiny`, `base`, `small`, `medium`, `large`.
 - Definir idioma, por ejemplo `es`.
-- Procesar audio con una barra de avance por etapa.
+- Procesar audio con una barra de avance por etapa y estimacion de tiempo restante (ETA).
+- Cancelar un proceso en curso con el boton `Cancelar`.
 - Ver la transcripcion en pantalla.
 - Copiar la transcripcion al portapapeles.
-- Guardar automaticamente los resultados en la carpeta `output/`.
+- Guardar automaticamente los resultados en la carpeta `output/` y abrirla con `Abrir carpeta`.
 
 Guardar los archivos de salida con el nombre del audio. Si ya existe una salida con el mismo nombre, agregar un sufijo numerico:
 
@@ -168,13 +177,15 @@ Opciones principales:
 
 ## Modelos Whisper
 
-Los modelos Whisper se descargan y cargan desde la carpeta local:
+La transcripcion usa **faster-whisper** (CTranslate2), que es notablemente mas rapido que Whisper de OpenAI en CPU y consume menos memoria, manteniendo la misma precision. La transcripcion aplica filtrado por VAD (deteccion de voz) para saltar silencios y acelerar el procesamiento.
+
+Los modelos (formato CTranslate2) se descargan y cachean en la carpeta local:
 
 ```text
 models/
 ```
 
-Si el modelo no existe, descargar automaticamente. Si ya existe, reutilizar.
+Si el modelo no existe, faster-whisper lo descarga automaticamente. Si ya existe, lo reutiliza. En CPU se usa cuantizacion `int8`; con GPU CUDA disponible se usa `float16` de forma automatica.
 
 ## Salidas
 
